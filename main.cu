@@ -1,9 +1,9 @@
 // This is a GPU implementation of LDLt factorization
 
-#include <studio.h>
+#include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
-#include "timer.h"
+// #include "timer.h"
 
 __global__ void LDLt_max_k(float *A, float *y, int d) {
     int tidx = threadIdx.x % d; // Thread identifier in a grid for solving one linear system
@@ -23,7 +23,7 @@ __global__ void LDLt_max_k(float *A, float *y, int d) {
         int offset = -d;
         for (i = 0; i < d; i++) {
             offset += d - i;
-            for (k = i, k < d; k++) {
+            for (k = i; k < d; k++) {
                 sA[nt + d + offset + k] = A[gbx*d*d + k*d + i];
             }
         }
@@ -31,6 +31,27 @@ __global__ void LDLt_max_k(float *A, float *y, int d) {
             sA[nt + i] = y[gbx*d + i];
         }
     }
+
+    // // Verifier that the data is really copied from global memory to shared memory
+    // if (gbx == 199 && tidx == d-1) {
+    //     int offset = -d;
+    //     for (i = 0; i < d; i++) {
+    //         offset += d - i;
+    //         for (k = 0; k < i; k++) {
+    //             printf("%f\t", 0.0f);
+    //         }
+    //         for (k = i; k < d; k++) {
+    //             printf("%f\t", sA[nt + d + offset + k]);
+    //         }
+    //         printf("\n");
+    //     }
+    //     printf("\n");
+    //     for (i = 0; i < d; i++){
+    //         printf("%f\t", sA[nt + i]);
+    //     }
+    //     printf("\n");
+    //     printf("\n");
+    // }
     __syncthreads(); // Wait for the collection finishing
 
     // Perform the LDLt factorization
@@ -70,10 +91,12 @@ __global__ void LDLt_max_k(float *A, float *y, int d) {
     
 }
 
+// NB: The shared memory of Tesla P100-PCIE-16GB is 48KB
+// The data to be copied to shared memory should not exceed this size
 int main() {
     int i, j, k;
     int dim = 64; // The size of the matrix
-    int minTB = 16; // The number of grids per block
+    int minTB = 5; // The number of grids per block
     int NB = 16384; // The number of blocks
     int size = NB * minTB; // The number of matrices to be factorized
     float rho; // Parameters to fill the matrices
@@ -87,8 +110,8 @@ int main() {
     cudaEventCreate(&stop);
 
     // Memory allocation
-    A = (float *)malloc(size*dim*dim, sizeof(float));
-    Y = (float *)malloc(size*dim, sizeof(float));
+    A = (float *)malloc(size*dim*dim*sizeof(float));
+    Y = (float *)malloc(size*dim*sizeof(float));
     cudaMalloc(&AGPU, size*dim*dim*sizeof(float));
     cudaMalloc(&YGPU, size*dim*sizeof(float));
 
@@ -108,13 +131,26 @@ int main() {
         }
     }
 
+    // i = 199;
+    // for (j = 0; j < dim; j++) {
+    //     for (k = 0; k < dim; k++) {
+    //         printf("%f\t", A[i*dim*dim + j*dim + k]);
+    //     }
+    //     printf("\n");
+    // }
+    // for (j = 0; j < dim; j++) {
+    //     printf("%f\t", Y[i*dim + j]);
+    // }
+    // printf("\n");
+    // printf("\n");
+
     // Copy matrices and vectors from cpu to GPU
     cudaMemcpy(AGPU, A, size*dim*dim*sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(YGPU, Y, size*dim*sizeof(float), cudaMemcpyHostToDevice);
     cudaEventRecord(start, 0); // GPU timer starts
 
     // Solve the linear systems using LDLt factorization on GPU
-    LDLt_max_k<<<NB, dim*minTB, minTB*(d*(d+1)/2 + d)*sizeof(float)>>>(AGPU, YGPU, dim);
+    LDLt_max_k<<<NB, dim*minTB, minTB*(dim*(dim+1)/2 + dim)*sizeof(float)>>>(AGPU, YGPU, dim);
 
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -128,8 +164,9 @@ int main() {
     // Check a numerical result
     i = 199;
     for (j = 0; j < dim; j++) {
-        printf("%f\n", Y[i*dim + j]);
+        printf("%f\t", Y[i*dim + j]);
     }
+    printf("\n");
 
     printf("GPU Timer: %f ms\n", TimVar);
 
