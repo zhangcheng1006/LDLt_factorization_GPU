@@ -3,7 +3,58 @@
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
-// #include "timer.h"
+#include "timer.h"
+
+void LDLt(float *A, float *y, int d, int i) {
+    float L[d][d];
+    float D[d];
+    float b[d], z[d];
+    int j, k, l;
+
+    // Perform LDLt factorization
+    for (j = 0; j < d; j++) {
+        D[j] = A[i*d*d + j*d + j];
+        for (k = 0; k < j; k++) {
+            D[j] -= L[j][k] * L[j][k] * D[k];
+        }
+        // printf("%f\n", D[j]);
+        for (k = j+1; k < d; k++) {
+            L[k][j] = A[i*d*d + k*d + j] / D[j];
+            for (l = 0; l < j; l++) {
+                L[k][j] -= L[k][l] * L[j][l] * D[l] / D[j];
+            }
+            // printf("%f\t", L[k][j]);
+        }
+        // printf("\n");
+    }
+
+    // Solve the linear system
+    for (j = 0; j < d; j++) {
+        b[j] = y[j];
+        for (k = 0; k < j; k++) {
+            b[j] -= L[j][k] * b[k];
+        }
+        // printf("%f\n", b[j]);
+        z[j] = b[j] / D[j];
+        // printf("%f\n", z[j]);
+    }
+    for (j = d-1; j >= 0; j--) {
+        y[j] = z[j];
+        for (k = d-1; k > j; k--) {
+            y[j] -=  y[k] * L[k][j];
+        }
+    }
+}
+
+float Check_Result(float *y1, float *y2, int d) {
+    int i;
+    float error = 0.0f;
+    for (i = 0; i < d; i++) {
+        error += (y1[i] - y2[i]) * (y1[i] - y2[i]);
+    }
+    error /= d;
+    return error;
+}
 
 __global__ void LDLt_max_k(float *A, float *y, int d) {
     int tidx = threadIdx.x % d; // Thread identifier in a grid for solving one linear system
@@ -18,40 +69,31 @@ __global__ void LDLt_max_k(float *A, float *y, int d) {
     n2 = grid;
     nt = Qt * grid;
 
-    // The d-th thread in a grid collects matrix and vector from global to shared memory
-    if (tidx == d-1) {
-        int offset = -d;
-        for (i = 0; i < d; i++) {
-            offset += d - i;
-            for (k = i; k < d; k++) {
-                sA[nt + d + offset + k] = A[gbx*d*d + k*d + i];
-            }
+    // The d threads in a grid parallelly collect matrix and vector from global to shared memory
+    // // version 1
+    // for (i = d; i > 0; i--) {
+    //     if (tidx < i) {
+    //         sA[nt + n2 - i*(i+1)/2 + tidx] = A[gbx*d*d + (d-i)*d + tidx + d-i];
+    //     }
+    // }
+    // sA[nt + tidx] = y[gbx*d + tidx];
+    // __syncthreads(); // Wait for the collection finishing
+
+    // version 2
+    for (i = d; i > d/2; i--) {
+        if (tidx < i) {
+            sA[nt + n2 - i*(i+1)/2 + tidx] = A[gbx*d*d + (d-i)*d + tidx + d-i];
         }
-        for (i = 0; i < d; i++){
-            sA[nt + i] = y[gbx*d + i];
+        else {
+            sA[nt + n2 - (d-i)*(d-i+1)/2 + tidx - i] = A[gbx*d*d + i*d + tidx];
         }
     }
-
-    // // Verifier that the data is really copied from global memory to shared memory
-    // if (gbx == 199 && tidx == d-1) {
-    //     int offset = -d;
-    //     for (i = 0; i < d; i++) {
-    //         offset += d - i;
-    //         for (k = 0; k < i; k++) {
-    //             printf("%f\t", 0.0f);
-    //         }
-    //         for (k = i; k < d; k++) {
-    //             printf("%f\t", sA[nt + d + offset + k]);
-    //         }
-    //         printf("\n");
-    //     }
-    //     printf("\n");
-    //     for (i = 0; i < d; i++){
-    //         printf("%f\t", sA[nt + i]);
-    //     }
-    //     printf("\n");
-    //     printf("\n");
-    // }
+    if (d % 2 == 0) {
+        if (tidx < d/2) {
+            sA[nt + n2 - d/2*(d/2+1)/2 + tidx] = A[gbx*d*d + (d/2)*d + tidx + d/2];
+        }
+    }
+    sA[nt + tidx] = y[gbx*d + tidx];
     __syncthreads(); // Wait for the collection finishing
 
     // Perform the LDLt factorization
@@ -63,6 +105,7 @@ __global__ void LDLt_max_k(float *A, float *y, int d) {
             }
         }
         __syncthreads(); // Wait for finishing D_i computation
+
         // The first i-1 threads in a grid compute L_ji
         if (tidx < i-1) {
             sA[nt + n2 - i*(i+1)/2 + tidx + 1] /= sA[nt + n2 - i*(i+1)/2];
@@ -74,35 +117,241 @@ __global__ void LDLt_max_k(float *A, float *y, int d) {
     }
 
     // Solving the linear system using LDLt factorization
-    if (tidx == d-1) {
-        for (i = d; i > 0; i--) {
-            for (k = d; k > i; k--) {
-                sA[nt + d - i] -= sA[nt + d - k] * sA[nt + n2 - k*(k+1)/2 + k - i];
-            }
-            sA[nt + d - i] /= sA[nt + n2 - i*(i+1)/2];
+    for (i = d-1; i > 0; i--) {
+        if (tidx < i) {
+            sA[nt + d - i + tidx] -= sA[nt + d - i - 1] * sA[nt + n2 - (i+1)*(i+2)/2 + tidx + 1];
         }
-        for (i = 0; i < d; i++) {
-            for (k = 0; k < i; k++) {
-                sA[nt + d - i - 1] -= sA[nt + d - k - 1] * sA[nt + n2 - i*(i+1)/2 - k - 1]; // The final solution
-            }
-            y[gbx*d + d - i - 1] = sA[nt + d - i - 1]; // Copy the final solution from shared memory to global memory
+        __syncthreads(); // Waiting for the previous finishing
+    }
+    sA[nt + tidx] /= sA[nt + n2 - (d-tidx)*(d-tidx+1)/2];
+    __syncthreads(); // Waiting for all threads finishing
+    for (i = 1; i < d; i++) {
+        if (tidx < d-i) {
+            sA[nt + tidx] -= sA[nt + d - i] * sA[nt + n2 - (d-tidx)*(d-tidx+1)/2 + d-tidx-i];
+        }
+        __syncthreads(); // Waiting for the previous finishing
+    }
+    y[gbx*d + tidx] = sA[nt + tidx];
+}
+
+__global__ void LDLt_max_col_k(float *A, float *y, int d) {
+    int tidx = threadIdx.x % d; // Thread identifier in a grid for solving one linear system
+    int Qt = (threadIdx.x - tidx) / d; // Local grid identifier for one linear system
+    int gbx = Qt + blockIdx.x * (blockDim.x / d); // Global grid identifier 
+
+    extern __shared__ float sA[]; // shared memory to accelarate the computation
+
+    int i, k, grid, nt, n2;
+
+    grid = d*(d+1)/2 + d;
+    n2 = grid;
+    nt = Qt * grid;
+
+    // The d thread in a grid parallelly collect matrix and vector from global to shared memory
+    // // version 1
+    // for (i = d; i > 0; i--) {
+    //     if (tidx < i) {
+    //         sA[nt + n2 - i*(i+1)/2 + tidx] = A[gbx*d*d + (tidx + d-i)*d + d-i];
+    //     }
+    // }
+    // sA[nt + tidx] = y[gbx*d + tidx];
+    // __syncthreads(); // Wait for the collection finishing
+
+
+    // version 2
+    for (i = d; i > d/2; i--) {
+        if (tidx < i) {
+            sA[nt + n2 - i*(i+1)/2 + tidx] = A[gbx*d*d + (tidx + d-i)*d + d-i];
+        }
+        else {
+            sA[nt + n2 - (d-i)*(d-i+1)/2 + tidx - i] = A[gbx*d*d + tidx*d + i];
         }
     }
+    if (d % 2 == 0) {
+        if (tidx < d/2) {
+            sA[nt + n2 - d/2*(d/2+1)/2 + tidx] = A[gbx*d*d + (tidx + d/2)*d + d/2];
+        }
+    }
+    sA[nt + tidx] = y[gbx*d + tidx];
+    __syncthreads(); // Wait for the collection finishing
+
+    // Perform the LDLt factorization
+    for (i = d; i > 0; i--) {
+        // The first thread in a grid computes D_i
+        if (tidx == 0) {
+            for (k = d; k > i; k--) {
+                sA[nt + n2 - i*(i+1)/2] -= sA[nt + n2 - k*(k+1)/2] * sA[nt + n2 - k*(k+1)/2 + k - i] * sA[nt + n2 - k*(k+1)/2 + k - i];
+            }
+        }
+        __syncthreads(); // Wait for finishing D_i computation
+
+        // The first i-1 threads in a grid compute L_ji
+        if (tidx < i-1) {
+            sA[nt + n2 - i*(i+1)/2 + tidx + 1] /= sA[nt + n2 - i*(i+1)/2];
+            for (k = d; k > i; k--) {
+                sA[nt + n2 - i*(i+1)/2 + tidx + 1] -= sA[nt + n2 - k*(k+1)/2] * sA[nt + n2 - k*(k+1)/2 + k - i] * sA[nt + n2 - k*(k+1)/2 + tidx + 1 + k - i] / sA[nt + n2 - i*(i+1)/2];
+            }
+        }
+        __syncthreads(); // Wait for finishing L_ji computation
+    }
+
+    // Solving the linear system using LDLt factorization
+    for (i = d-1; i > 0; i--) {
+        if (tidx < i) {
+            sA[nt + d - i + tidx] -= sA[nt + d - i - 1] * sA[nt + n2 - (i+1)*(i+2)/2 + tidx + 1];
+        }
+        __syncthreads(); // Waiting for the previous finishing
+    }
+    sA[nt + tidx] /= sA[nt + n2 - (d-tidx)*(d-tidx+1)/2];
+    __syncthreads(); // Waiting for all threads finishing
+    for (i = 1; i < d; i++) {
+        if (tidx < d-i) {
+            sA[nt + tidx] -= sA[nt + d - i] * sA[nt + n2 - (d-tidx)*(d-tidx+1)/2 + d-tidx-i];
+        }
+        __syncthreads(); // Waiting for the previous finishing
+    }
+    y[gbx*d + tidx] = sA[nt + tidx];
     
+}
+
+// LDLt factorization for large d > 64
+// We can no more copy all the data to the shared memory because of memory limitation
+// But we can still copy the vector y and diagonal elements to shared memory
+__global__ void LDLt_large_k(float *A, float *y, int d) {
+    int tidx = threadIdx.x % d; // Thread identifier in a grid for solving one linear system
+    int Qt = (threadIdx.x - tidx) / d; // Local grid identifier for one linear system
+    int gbx = Qt + blockIdx.x * (blockDim.x / d); // Global grid identifier 
+
+    extern __shared__ float sA[];
+
+    int i, k, grid, nt, n2, gbn;
+
+    float res;
+
+    grid = 2 * d;
+    nt = Qt * grid;
+    n2 = d;
+    gbn = gbx * d * d;
+
+    // copy y and diagonal elements to shared memory
+    sA[nt + tidx] = y[gbx*d + tidx];
+    sA[nt + n2 + tidx] = A[gbn + tidx*d + tidx];
+    __syncthreads();
+
+    // Perform the LDLt factorization
+    for (i = 0; i < d; i++) {
+        // The first thread in a grid computes D_i
+        if (tidx == 0) {
+            for (k = 0; k < i; k++) {
+                sA[nt + n2 + i] -= A[gbn + k*d + i] * A[gbn + k*d + i] * sA[nt + n2 + k];
+            }
+        }
+        __syncthreads(); // Wait for finishing D_i computation
+
+        // The first i-1 threads in a grid compute L_ji
+        if (tidx > i) {
+            res = A[gbn + i*d + tidx];
+            res /= sA[nt + n2 + i];
+            for (k = 0; k < i; k++) {
+                res -= sA[nt + n2 + k] * A[gbn + k*d + tidx] * A[gbn + k*d + i] / sA[nt + n2 + i];
+            }
+            A[gbn + i*d + tidx] = res;
+        }
+        __syncthreads(); // Wait for finishing L_ji computation
+    }
+
+    // Solving the linear system using LDLt factorization
+    for (i = 1; i < d; i++) {
+        if (tidx >= i) {
+            sA[nt + tidx] -= sA[nt + i - 1] * A[gbn + (i-1)*d + tidx];
+        }
+        __syncthreads(); // Waiting for the previous finishing
+    }
+    sA[nt + tidx] /= sA[nt + n2 + tidx];
+    __syncthreads(); // Waiting for all threads finishing
+    for (i = d-1; i > 0; i--) {
+        if (tidx < i) {
+            sA[nt + tidx] -= sA[nt + i] * A[gbn + tidx*d + i];
+        }
+        __syncthreads(); // Waiting for the previous finishing
+    }
+    y[gbx*d + tidx] = sA[nt + tidx];
+}
+
+__global__ void LDLt_large_col_k(float *A, float *y, int d) {
+    int tidx = threadIdx.x % d; // Thread identifier in a grid for solving one linear system
+    int Qt = (threadIdx.x - tidx) / d; // Local grid identifier for one linear system
+    int gbx = Qt + blockIdx.x * (blockDim.x / d); // Global grid identifier 
+
+    extern __shared__ float sA[];
+
+    int i, k, grid, nt, n2, gbn;
+
+    float res;
+
+    grid = 2 * d;
+    nt = Qt * grid;
+    n2 = d;
+    gbn = gbx * d * d;
+
+    // copy y and diagonal elements to shared memory
+    sA[nt + tidx] = y[gbx*d + tidx];
+    sA[nt + n2 + tidx] = A[gbn + tidx*d + tidx];
+    __syncthreads();
+
+    // Perform the LDLt factorization
+    for (i = 0; i < d; i++) {
+        // The first thread in a grid computes D_i
+        if (tidx == 0) {
+            for (k = 0; k < i; k++) {
+                sA[nt + n2 + i] -= A[gbn + i*d + k] * A[gbn + i*d + k] * sA[nt + n2 + k];
+            }
+        }
+        __syncthreads(); // Wait for finishing D_i computation
+
+        // The first i-1 threads in a grid compute L_ji
+        if (tidx > i) {
+            res = A[gbn + tidx*d + i];
+            res /= sA[nt + n2 + i];
+            for (k = 0; k < i; k++) {
+                res -= sA[nt + n2 + k] * A[gbn + tidx*d + k] * A[gbn + i*d + k] / sA[nt + n2 + i];
+            }
+            A[gbn + tidx*d + i] = res;
+        }
+        __syncthreads(); // Wait for finishing L_ji computation
+    }
+
+    // Solving the linear system using LDLt factorization
+    for (i = 1; i < d; i++) {
+        if (tidx >= i) {
+            sA[nt + tidx] -= sA[nt + i - 1] * A[gbn + tidx*d + i-1];
+        }
+        __syncthreads(); // Waiting for the previous finishing
+    }
+    sA[nt + tidx] /= sA[nt + n2 + tidx];
+    __syncthreads(); // Waiting for all threads finishing
+    for (i = d-1; i > 0; i--) {
+        if (tidx < i) {
+            sA[nt + tidx] -= sA[nt + i] * A[gbn + i*d + tidx];
+        }
+        __syncthreads(); // Waiting for the previous finishing
+    }
+    y[gbx*d + tidx] = sA[nt + tidx];
 }
 
 // NB: The shared memory of Tesla P100-PCIE-16GB is 48KB
 // The data to be copied to shared memory should not exceed this size
 int main() {
     int i, j, k;
-    int dim = 64; // The size of the matrix
-    int minTB = 5; // The number of grids per block
-    int NB = 16384; // The number of blocks
+    int dim = 1024; // The size of the matrix
+    int minTB = 1; // The number of grids per block
+    // int NB = 16384; // The number of blocks
+    // int NB = 2019;
+    int NB = 219;
     int size = NB * minTB; // The number of matrices to be factorized
     float rho; // Parameters to fill the matrices
     float *A, *AGPU, *Y, *YGPU; // The matrices and the vectors both on CPU and GPU
 
-    // Timer Tim; // CPU timer instructions
     // GPU timer instructions
     float TimVar;
     cudaEvent_t start, stop;
@@ -114,6 +363,9 @@ int main() {
     Y = (float *)malloc(size*dim*sizeof(float));
     cudaMalloc(&AGPU, size*dim*dim*sizeof(float));
     cudaMalloc(&YGPU, size*dim*sizeof(float));
+
+    printf("Memory Allocated!\n");
+    printf("%i\n", size*dim*dim);
 
     // Setting matrix and vector values
     for (i = 0; i < size; i++) {
@@ -131,18 +383,32 @@ int main() {
         }
     }
 
-    // i = 199;
-    // for (j = 0; j < dim; j++) {
-    //     for (k = 0; k < dim; k++) {
-    //         printf("%f\t", A[i*dim*dim + j*dim + k]);
-    //     }
-    //     printf("\n");
-    // }
-    // for (j = 0; j < dim; j++) {
-    //     printf("%f\t", Y[i*dim + j]);
-    // }
-    // printf("\n");
-    // printf("\n");
+    printf("Matrices and Vectors set!\n");
+
+    // Check one numerical result in CPU
+    i = 29;
+    float x[dim];
+    for (j = 0; j < dim; j++) {
+        x[j] = Y[i*dim + j];
+    }
+
+    Timer Tim; // CPU timer instructions
+
+    Tim.start(); // CPU timer instructions
+
+    LDLt(A, x, dim, i);
+
+    Tim.add(); // CPU timer instructions
+
+
+    for (j = 0; j < dim; j++) {
+        printf("%f\t", x[j]);
+    }
+    printf("\n\n");
+
+    printf("CPU Timer for one linear system: %f ms\n\n", (float)Tim.getsum()*1000); // CPU timer instructions
+    // Estimate the time for solving all linear systems
+    printf("Estimation of CPU Time for solving all linear systems: %f s\n\n", (float)Tim.getsum()*size);
 
     // Copy matrices and vectors from cpu to GPU
     cudaMemcpy(AGPU, A, size*dim*dim*sizeof(float), cudaMemcpyHostToDevice);
@@ -150,7 +416,10 @@ int main() {
     cudaEventRecord(start, 0); // GPU timer starts
 
     // Solve the linear systems using LDLt factorization on GPU
-    LDLt_max_k<<<NB, dim*minTB, minTB*(dim*(dim+1)/2 + dim)*sizeof(float)>>>(AGPU, YGPU, dim);
+    // LDLt_max_k<<<NB, dim*minTB, minTB*(dim*(dim+1)/2 + dim)*sizeof(float)>>>(AGPU, YGPU, dim);
+    // LDLt_max_col_k<<<NB, dim*minTB, minTB*(dim*(dim+1)/2 + dim)*sizeof(float)>>>(AGPU, YGPU, dim);
+    // LDLt_large_k<<<NB, dim*minTB, minTB*dim*2*sizeof(float)>>>(AGPU, YGPU, dim);
+    LDLt_large_col_k<<<NB, dim*minTB, minTB*dim*2*sizeof(float)>>>(AGPU, YGPU, dim);
 
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -161,14 +430,17 @@ int main() {
     // Copy result from GPU to CPU
     cudaMemcpy(Y, YGPU, size*dim*sizeof(float), cudaMemcpyDeviceToHost);
 
-    // Check a numerical result
-    i = 199;
+    // Check the selected numerical result
     for (j = 0; j < dim; j++) {
         printf("%f\t", Y[i*dim + j]);
     }
-    printf("\n");
+    printf("\n\n");
 
-    printf("GPU Timer: %f ms\n", TimVar);
+    printf("GPU Timer: %f ms\n\n", TimVar);
+
+    float error;
+    error = Check_Result(x, Y+i*dim, dim);
+    printf("The calculation error between CPU and GPU is: %f\n", error);
 
     // Memory free
     free(A);
